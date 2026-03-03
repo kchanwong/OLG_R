@@ -1,20 +1,5 @@
 # ============================================================
-# PWBM Social Security OLG Model — Couples Extension
-# Rewritten from functions_pwbm.jl (v9, equil-hours AIME)
-#
-# Adds: joint household problem with (a, z₁, z₂, marital_status)
-#   marital_status ∈ {couple, survivor₁, survivor₂}
-#   Gender-specific mortality for within-couple transitions
-#   Married-filing-jointly tax brackets
-#   Swappable benefit functions for policy scoring:
-#     - Current law (spousal + survivor)
-#     - Capped spousal benefits
-#     - Earnings sharing
-#     - Caregiver credits
-#
-# Dependencies:
-#   using Pkg
-#   Pkg.add(["Distributions", "Printf", "Statistics", "LinearAlgebra"])
+# OLG Model - With Couples 
 # ============================================================
 
 using Distributions
