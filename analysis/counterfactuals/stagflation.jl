@@ -1,5 +1,5 @@
 # Import Function 
-include("C:/Users/kchanwong/Documents/PWBM/julia_port/functions_pwbm.jl")
+include("C:/Users/kchanwong/Documents/PWBM/julia_port/functions_pwbm_w_spouse.jl")
 # Packages Needed 
 using DataFrames
 using Plots
@@ -10,32 +10,30 @@ par = create_params()
 ss  = solve_steady_state(par);
 # Baseline Dependency Path #
 dep_path = CSV.read("C:/Users/kchanwong/Documents/PWBM/julia_port/dep_rat.csv", DataFrame) |> DataFrame
-dep_path[!, :dep_rat] = ifelse.(dep_path.year .<= 2040, dep_path.dep_rat, 1.025 .* dep_path.dep_rat)# Run projection
+dep_path[!, :dep_rat] = ifelse.(dep_path.year .<= 2040, dep_path.dep_rat, dep_path.dep_rat)# Run projection
 proj = project_economy(
     ss,
     n_years         = 75,
     start_year      = 2025,
     g_A             = 0.0113,
-    g_pop           = 0.03,
+    g_pop           = 0.05,
     inflation       = 0.024,
-    dep_path        = 1.15 * dep_path.dep_rat,
+    dep_path        = 0.9 * dep_path.dep_rat,
     ss_cola         = "wage",
     trust_fund_init = 2.76e12,
-    trust_fund_rate = 0.047,
-    economy_scale   = 28.0
+    trust_fund_rate = 0.047
 );
 proj_STAG1 = project_economy(
     ss,
     n_years         = 75,
     start_year      = 2025,
     g_A             = 0.0113,
-    g_pop           = 0.03,
+    g_pop           = 0.05,
     inflation       = 0.029,
-    dep_path        = 1.15 * dep_path.dep_rat,
+    dep_path        = 0.9 * dep_path.dep_rat,
     ss_cola         = "wage",
     trust_fund_init = 2.76e12,
     trust_fund_rate = 0.047,
-    economy_scale   = 28.0,
     scenario_periods = 
     [Dict(:year_start => 2033, :year_end => 2042,
              :g_A => -0.01/2, :inflation => 0.024)]
@@ -45,13 +43,12 @@ proj_STAG2 = project_economy(
     n_years         = 75,
     start_year      = 2025,
     g_A             = 0.0113,
-    g_pop           = 0.03,
+    g_pop           = 0.05,
     inflation       = 0.029,
-    dep_path        = 1.15 * dep_path.dep_rat,
+    dep_path        = 0.9 * dep_path.dep_rat,
     ss_cola         = "wage",
     trust_fund_init = 2.76e12,
     trust_fund_rate = 0.047,
-    economy_scale   = 28.0,
     scenario_periods = 
     [Dict(:year_start => 2033, :year_end => 2042,
              :g_A => -0.01, :inflation => 0.024,
@@ -60,10 +57,8 @@ proj_STAG2 = project_economy(
 plot(proj.year, 100 * proj.ss_cash_flow_nom./proj.taxable_payroll_nom, label = "Baseline", xlabel = "Year", 
 ylabel = "% of Taxable Payroll", title = "Projected Outlays",
 ylim = (-7, 0))
-plot!(proj.year, 100 * proj_STAG1.ss_cash_flow_nom./proj_STAG1.taxable_payroll_nom, lwd = 3, label = "Add 0.5% Inflation")
-plot!(proj.year, 100 * proj_STAG2.ss_cash_flow_nom./proj_STAG2.taxable_payroll_nom, lwd = 3, label = "Add 0.5% Inflation");
-
-
+plot!(proj.year, 100 * proj_STAG1.ss_cash_flow_nom./proj_STAG1.taxable_payroll_nom, lwd = 3, label = "Add 0.5% Inflation");
+plot!(proj.year, 100 * proj_STAG2.ss_cash_flow_nom./proj_STAG2.taxable_payroll_nom, lwd = 3, label = "Add 1% Inflation");
 XLSX.openxlsx("C:/Users/kchanwong/Documents/PWBM/julia_port/projections_stagflation.xlsx", mode="w") do xf
     for (name, p) in [("Baseline", proj), ("STAG1", proj_STAG1), ("STAG2", proj_STAG2)]
         sheet = XLSX.addsheet!(xf, name)
