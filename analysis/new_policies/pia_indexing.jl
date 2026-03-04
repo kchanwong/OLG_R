@@ -30,7 +30,6 @@ function project_economy_indexed(
     trust_fund_rate::Float64  = 0.035,
     ss_reform             = nothing,
     reform_year           = nothing,
-    reform_phase_in::Int  = 10,
     label::String         = "Current Law",
     scenario_periods      = nothing,
     thresh_sens::Float64  = 0.3,
@@ -43,6 +42,7 @@ function project_economy_indexed(
 
     base = extract_ss_ratios(ss)
     mu   = base.mu_dollar; par = ss.par
+    alpha = par[:alpha]
 
     ssa_covered_workers = 180e6
     N_hh = ssa_covered_workers / base.worker_mass
@@ -51,11 +51,18 @@ function project_economy_indexed(
     @printf("  Implied GDP: \$%.1fT\n",
             base.Y * mu * N_hh / 1e12)
 
+    # --- Steady-state aggregates for transition path ---
+    K_base = ss.K;  L_base = ss.L
+    K_ref  = 0.0;   L_ref  = 0.0
+
     has_reform = !isnothing(ss_reform) && !isnothing(reform_year)
     ref = nothing
+    conv_rate = 0.0
     if has_reform
         ref = extract_ss_ratios(ss_reform)
-        @printf("  Reform at %d, phase-in %d yrs\n", reform_year, reform_phase_in)
+        K_ref = ss_reform.K;  L_ref = ss_reform.L
+        @printf("  Reform at %d\n", reform_year)
+        conv_rate = compute_convergence_rate(ss, g_A=g_A)
     end
     if ccpiu_wedge > 0
         @printf("  C-CPI-U indexing from %d (wedge=%.1f bp)\n",
@@ -108,7 +115,7 @@ function project_economy_indexed(
         for t in 2:n_years; cum_new_ben[t] = cum_new_ben[t-1]*(1+rate); end
     end
 
-    # Apply C-CPI-U wedge: slower new-beneficiary indexing after ccpiu_start_year
+    # Apply C-CPI-U wedge
     if ccpiu_wedge > 0
         cum_new_ben_adj = copy(cum_new_ben)
         for t in 2:n_years
@@ -137,12 +144,11 @@ function project_economy_indexed(
                              max(ref.ss_ben_per_retiree, 1e-12)
     end
 
-    # --- Precompute bend points and average AIME (once, outside loop) ---
+    # --- Precompute bend points and average AIME ---
     b1_mu = par[:ss_bend1] / mu
     b2_mu = par[:ss_bend2] / mu
 
-    # Numerically invert current-law PIA to find average AIME in model units
-    avg_aime_mu = b2_mu  # initial guess
+    avg_aime_mu = b2_mu
     pia_base_level = base.ss_ben_per_retiree
     for _ in 1:20
         pia_try = 0.90*min(avg_aime_mu, b1_mu) +
@@ -155,7 +161,6 @@ function project_economy_indexed(
         avg_aime_mu = max(avg_aime_mu, 0.01)
     end
 
-    # Current-law PIA at average AIME (constant reference for scaling)
     pia_current_law = 0.90*min(avg_aime_mu, b1_mu) +
                       0.32*max(0.0, min(avg_aime_mu, b2_mu) - b1_mu) +
                       0.15*max(0.0, avg_aime_mu - b2_mu)
@@ -193,35 +198,60 @@ function project_economy_indexed(
 
     for t in 1:n_years
         yr  = year_cal[t]
-        lam = 0.0
+
+        # === Mankiw-Weinzierl transition path ===
+        omega = 0.0
         if has_reform && yr >= reform_year
-            lam = min(1.0, (yr - reform_year) / reform_phase_in)
+            tau   = Float64(yr - reform_year)
+            decay = exp(conv_rate * tau)
+            omega = 1.0 - decay
+
+            K_mu = exp(log(K_ref) + (log(K_base) - log(K_ref)) * decay)
+            L_mu = exp(log(L_ref) + (log(L_base) - log(L_ref)) * decay)
+        else
+            K_mu = K_base
+            L_mu = L_base
         end
+
+        # Derive macro aggregates from production function
+        Y_mu = K_mu^alpha * L_mu^(1-alpha)
+        w_mu = (1-alpha) * (K_mu / L_mu)^alpha
+
+        # Interpolate distributional variables
+        interp(bv, rv) = bv + omega * (rv - bv)
+        fica_rate_t      = has_reform ? interp(base.payroll_rate,   ref.payroll_rate)   : base.payroll_rate
+        pct_above_t      = has_reform ? interp(base.pct_above_cap,  ref.pct_above_cap)  : base.pct_above_cap
+        inc_tax_mu       = has_reform ? interp(base.income_tax,     ref.income_tax)     : base.income_tax
+        btax_oasi_rate_t = has_reform ? interp(btax_rate_oasi_base, btax_rate_oasi_ref) : btax_rate_oasi_base
+        btax_hi_rate_t   = has_reform ? interp(btax_rate_hi_base,   btax_rate_hi_ref)   : btax_rate_hi_base
+
+        # Corporate tax from transition path
+        zeta_corp = par[:zeta_income_corp]
+        corp_profit_mu = zeta_corp * (Y_mu - w_mu * L_mu - par[:delta] * K_mu)
+        corp_tax_mu = par[:tau_statutory_corp] *
+                      max(0.0, corp_profit_mu) *
+                      (1 - par[:phi_exp_corp]*0.3 - par[:zeta_ded_corp])
 
         dep_t     = dep_path[t]
         dep_scale = dep_t / base.dep_ratio
-        bl(bv,rv) = (1-lam)*bv + lam*rv
 
-        # --- Compute new_ben_scale_t from year-specific PIA factors ---
+        # --- PIA factor indexing: factors decay by price/wage ratio ---
         if pia_factor_indexing && !isnothing(reform_year) && yr >= reform_year
-            # PIA factors decay each year by the ratio of price growth to wage growth
-            # since the reform year (= 1 / cumulative real wage growth since reform)
             t_ref = findfirst(==(reform_year), year_cal)
-            price_wage_ratio = cum_A[t_ref] / cum_A[t]
+            price_wage_ratio = isnothing(t_ref) ? 1.0 : cum_A[t_ref] / cum_A[t]
             f1 = 0.90 * price_wage_ratio
             f2 = 0.32 * price_wage_ratio
             f3 = 0.15 * price_wage_ratio
         else
-            f1, f2, f3 = pia_factors(yr)
+            f1 = 0.90; f2 = 0.32; f3 = 0.15
         end
 
-        # Bend points: AWI-indexed (constant in model units) before C-CPI-U switch,
-        # CPI-indexed (shrink in model units) after switch
+        # Bend points: AWI-indexed before C-CPI-U switch, CPI-indexed after
         if ccpiu_wedge > 0 && yr >= ccpiu_start_year
-            b1_t = b1_mu / cum_A[t]   # CPI-indexed: shrinks relative to wages
+            b1_t = b1_mu / cum_A[t]
             b2_t = b2_mu / cum_A[t]
         else
-            b1_t = b1_mu              # AWI-indexed: constant in model units
+            b1_t = b1_mu
             b2_t = b2_mu
         end
 
@@ -230,38 +260,21 @@ function project_economy_indexed(
                  f3*max(0.0, avg_aime_mu - b2_t)
         new_ben_scale_t = pia_yr / max(pia_current_law, 1e-10)
 
-        # --- GE variables: lam-based blend for non-benefit quantities ---
-        if lam > 0
-            fica_rate_t      = bl(base.payroll_rate,    ref.payroll_rate)
-            pct_above_t      = bl(base.pct_above_cap,   ref.pct_above_cap)
-            inc_tax_t        = bl(base.income_tax,      ref.income_tax)
-            corp_tax_t       = bl(base.corp_tax,        ref.corp_tax)
-            Y_t              = bl(base.Y,               ref.Y)
-            earn_pw_t        = bl(base.earn_per_worker, ref.earn_per_worker)
-            btax_oasi_rate_t = bl(btax_rate_oasi_base,  btax_rate_oasi_ref)
-            btax_hi_rate_t   = bl(btax_rate_hi_base,    btax_rate_hi_ref)
-        else
-            fica_rate_t      = base.payroll_rate
-            pct_above_t      = base.pct_above_cap
-            inc_tax_t        = base.income_tax
-            corp_tax_t       = base.corp_tax
-            Y_t              = base.Y
-            earn_pw_t        = base.earn_per_worker
-            btax_oasi_rate_t = btax_rate_oasi_base
-            btax_hi_rate_t   = btax_rate_hi_base
-        end
-
+        # === Scale to nominal dollars ===
         N_hh_t     = N_hh * cum_pop[t]
-        GDP_real_t = Y_t * cum_A[t] * mu * N_hh_t
+        GDP_real_t = Y_mu * cum_A[t] * mu * N_hh_t
         GDP_nom_t  = GDP_real_t * cum_price[t]
-        avg_earn_t = earn_pw_t * cum_A[t] * mu * cum_price[t]
+        avg_earn_t = (w_mu * L_mu / max(base.worker_mass, 1e-10)) *
+                     cum_A[t] * mu * cum_price[t]
 
-        total_pay_nom_t   = base.total_payroll * cum_A[t] * mu * cum_price[t] * N_hh_t
+        # Payroll from transition path
+        total_pay_nom_t   = w_mu * L_mu * cum_A[t] * mu * cum_price[t] * N_hh_t
         wage_cap_ratio    = cum_wage[t] / (cap_nom_vec[t] / cap_base_dollars)
         pct_above_adj     = min(0.50, pct_above_t * wage_cap_ratio)
         taxable_pay_nom_t = total_pay_nom_t * (1.0 - pct_above_adj)
         fica_rev_nom_t    = fica_rate_t * taxable_pay_nom_t
 
+        # SS outlays
         phi_t          = min(0.20, 1.0 / (working_years * dep_t))
         new_ben_real_t = base.ss_ben_per_retiree * cum_new_ben[t] * new_ben_scale_t
         avg_ben_real   = (1.0-phi_t)*avg_ben_real + phi_t*new_ben_real_t
@@ -269,6 +282,7 @@ function project_economy_indexed(
         n_ret_t        = base.retiree_mass * dep_scale * N_hh_t
         ss_outlays_nom_t = avg_ben_nom * n_ret_t
 
+        # Benefit taxation with bracket creep
         base_frac_oasi   = max(btax_oasi_rate_t / 0.85, 1e-6)
         creep_oasi       = 1.0 / (1 + (1/base_frac_oasi - 1) *
                                   exp(-thresh_sens * log(cum_price[t])))
@@ -283,6 +297,7 @@ function project_economy_indexed(
         ss_btax_hi_nom_t    = btax_hi_adj   * avg_ben_nom * n_ret_t
         ss_btax_total_nom_t = ss_btax_oasi_nom_t + ss_btax_hi_nom_t
 
+        # Trust fund
         r_nom_t        = (1.0 + par[:r_G]) * (1.0 + inf_vec[t]) - 1.0
         tf_interest_t  = trust_fund > 0 ? trust_fund * trust_fund_rate : 0.0
         ss_cash_flow_t = fica_rev_nom_t + ss_btax_oasi_nom_t - ss_outlays_nom_t
@@ -290,15 +305,17 @@ function project_economy_indexed(
         ss_balance_t   = ss_total_inc_t - ss_outlays_nom_t
         trust_fund    += ss_balance_t
 
-        other_tax_nom_t = (inc_tax_t + corp_tax_t) * cum_A[t] * mu * cum_price[t] * N_hh_t
+        # Government budget
+        other_tax_nom_t = (inc_tax_mu + corp_tax_mu) * cum_A[t] * mu * cum_price[t] * N_hh_t
         total_tax_nom_t = fica_rev_nom_t + other_tax_nom_t
-        G_nom_t         = base.G * cum_A[t] * mu * cum_price[t] * N_hh_t
+        G_nom_t         = par[:G_residual_share] * GDP_nom_t
 
         debt_t = t == 1 ?
             base.D * mu * N_hh * cum_price[t] :
             debt_nom[t-1] * 1e9 * (1 + r_nom_t) +
             (G_nom_t + ss_outlays_nom_t - total_tax_nom_t)
 
+        # Store
         GDP_real[t]                = GDP_real_t / 1e9
         GDP_nominal[t]             = GDP_nom_t  / 1e9
         avg_earnings_nominal[t]    = avg_earn_t
@@ -399,9 +416,14 @@ function project_economy_indexed(
      debt_to_gdp=debt_to_gdp_v,
      depletion_year=depl,
      cashflow_deficit_year=cf_def,
+     convergence_rate=conv_rate,
      label=label)
 end;
-project_economy_indexed(ss, ss_reform=ss_reform, reform_year=2029, reform_phase_in=8,
-    n_years = 75, start_year = 025, g_A = 0.0113, g_pop = 0.05, inflation = 0.024,
+
+dep_path = CSV.read("C:/Users/kchanwong/Documents/PWBM/julia_port/dep_rat.csv", 
+           DataFrame) |> DataFrame
+
+project_economy_indexed(ss, ss_reform=ss_reform, reform_year=2029,
+    n_years = 75, start_year = 2025, g_A = 0.0113, g_pop = 0.05, inflation = 0.024,
     dep_path = 0.9 * dep_path.dep_rat, ss_cola = "wage", trust_fund_init = 2.76e12,
     trust_fund_rate = 0.047, pia_factor_indexing = true);

@@ -1698,6 +1698,51 @@ awi_cap_path(cap_base::Float64, cum_wage::Vector{Float64}) =
 # PROJECT ECONOMY — with reform scoring
 # ============================================================
 
+function compute_convergence_rate(ss; g_A::Float64=0.012)
+    par = ss.par
+    alpha = par[:alpha]
+    delta = par[:delta]
+    sigma = par[:sigma]
+    beta  = par[:beta]
+
+    rho   = 1.0/beta - 1.0                # pure time preference
+    rho_eff = rho + (sigma - 1.0)*g_A     # effective discount rate
+
+    # Steady-state values
+    K_ss = ss.K
+    Y_ss = ss.Y
+    C_ss = ss.agg.C
+    r_K  = ss.r_K                          # gross MPK
+
+    # Jacobian entries (inelastic-labor Ramsey, Cobb-Douglas)
+    # J11 = ρ_eff  (≈ r* - δ - g, which equals ρ+(σ-1)g at SS)
+    # J12 = -1
+    # J21 = -(c*/σk*)(1-α)r*
+    # J22 = 0  (Euler equation = 0 at SS)
+    J11 = rho_eff
+    J21 = -(C_ss / (sigma * K_ss)) * (1.0 - alpha) * r_K
+
+    # Characteristic equation: λ² - J11·λ - J21 = 0
+    # (since J12=-1, J22=0, det = 0·J11 - (-1)·J21 = J21)
+    discriminant = J11^2 - 4.0*J21   # J21 < 0, so this is J11² + 4|J21| > 0
+    neg_eigenvalue = (J11 - sqrt(discriminant)) / 2.0
+
+    # Sanity checks
+    half_life = -log(2.0) / neg_eigenvalue
+
+    @printf("  Convergence rate λ = %.4f (half-life = %.1f years)\n",
+            neg_eigenvalue, half_life)
+    @printf("    J11 (ρ_eff) = %.4f, J21 = %.4f\n", J11, J21)
+    @printf("    C/K = %.3f, r_K = %.4f, σ = %.1f\n",
+            C_ss/K_ss, r_K, sigma)
+
+    neg_eigenvalue
+end
+
+# ============================================================
+# PROJECT ECONOMY — with reform scoring
+# ============================================================
+
 function project_economy(
     ss;
     n_years::Int          = 75,
@@ -1713,7 +1758,6 @@ function project_economy(
     trust_fund_rate::Float64  = 0.035,
     ss_reform             = nothing,
     reform_year           = nothing,
-    reform_phase_in::Int  = 10,
     label::String         = "Current Law",
     scenario_periods      = nothing,
     thresh_sens::Float64  = 0.3,
@@ -1734,9 +1778,18 @@ function project_economy(
 
     has_reform = !isnothing(ss_reform) && !isnothing(reform_year)
     ref = nothing
+    conv_rate = 0.0
+    alpha = par[:alpha]
+
+    # Steady-state macro aggregates (model units)
+    K_base = ss.K;  L_base = ss.L
+    K_ref  = 0.0;   L_ref  = 0.0
+
     if has_reform
         ref = extract_ss_ratios(ss_reform)
-        @printf("  Reform at %d, phase-in %d yrs\n", reform_year, reform_phase_in)
+        K_ref = ss_reform.K;  L_ref = ss_reform.L
+        @printf("  Reform at %d\n", reform_year)
+        conv_rate = compute_convergence_rate(ss, g_A=g_A)
     end
 
     if isnothing(dep_path)
@@ -1847,37 +1900,46 @@ function project_economy(
 
     for t in 1:n_years
         yr  = year_cal[t]
-        lam = 0.0
+
+        # === Transition path (Mankiw-Weinzierl eqs 34-35) ===
+        # K and L converge from baseline SS to reform SS at rate λ
+        omega = 0.0   # interpolation weight for distributional variables
         if has_reform && yr >= reform_year
-            lam = min(1.0, (yr - reform_year) / reform_phase_in)
+            tau   = Float64(yr - reform_year)
+            decay = exp(conv_rate * tau)   # starts at 1, decays → 0
+            omega = 1.0 - decay            # starts at 0, rises → 1
+
+            # Log-linear transition for macro aggregates
+            K_mu = exp(log(K_ref) + (log(K_base) - log(K_ref)) * decay)
+            L_mu = exp(log(L_ref) + (log(L_base) - log(L_ref)) * decay)
+        else
+            K_mu = K_base
+            L_mu = L_base
         end
+
+        # Macro aggregates derived from production function
+        Y_mu = K_mu^alpha * L_mu^(1-alpha)
+        w_mu = (1-alpha) * (K_mu / L_mu)^alpha
+
+        # Interpolate distributional / institutional variables (ω-weighted)
+        interp(bv, rv) = bv + omega * (rv - bv)
+        fica_rate_t      = has_reform ? interp(base.payroll_rate,  ref.payroll_rate)  : base.payroll_rate
+        pct_above_t      = has_reform ? interp(base.pct_above_cap, ref.pct_above_cap) : base.pct_above_cap
+        inc_tax_mu       = has_reform ? interp(base.income_tax,    ref.income_tax)    : base.income_tax
+        btax_oasi_rate_t = has_reform ? interp(btax_rate_oasi_base, btax_rate_oasi_ref) : btax_rate_oasi_base
+        btax_hi_rate_t   = has_reform ? interp(btax_rate_hi_base,   btax_rate_hi_ref)   : btax_rate_hi_base
+        new_ben_scale_t  = has_reform ?
+            interp(base.ss_ben_per_retiree, ref.ss_ben_per_retiree) / base.ss_ben_per_retiree : 1.0
+
+        # Corporate tax — derived directly from transition path
+        zeta_corp = par[:zeta_income_corp]
+        corp_profit_mu = zeta_corp * (Y_mu - w_mu * L_mu - par[:delta] * K_mu)
+        corp_tax_mu = par[:tau_statutory_corp] *
+                      max(0.0, corp_profit_mu) *
+                      (1 - par[:phi_exp_corp]*0.3 - par[:zeta_ded_corp])
 
         dep_t     = dep_path[t]
         dep_scale = dep_t / base.dep_ratio
-        bl(bv,rv) = (1-lam)*bv + lam*rv
-
-        if lam > 0
-            fica_rate_t      = bl(base.payroll_rate,    ref.payroll_rate)
-            pct_above_t      = bl(base.pct_above_cap,   ref.pct_above_cap)
-            inc_tax_t        = bl(base.income_tax,      ref.income_tax)
-            corp_tax_t       = bl(base.corp_tax,        ref.corp_tax)
-            Y_t              = bl(base.Y,               ref.Y)
-            earn_pw_t        = bl(base.earn_per_worker, ref.earn_per_worker)
-            btax_oasi_rate_t = bl(btax_rate_oasi_base,  btax_rate_oasi_ref)
-            btax_hi_rate_t   = bl(btax_rate_hi_base,    btax_rate_hi_ref)
-            new_ben_scale_t  = bl(base.ss_ben_per_retiree,
-                                  ref.ss_ben_per_retiree) / base.ss_ben_per_retiree
-        else
-            fica_rate_t      = base.payroll_rate
-            pct_above_t      = base.pct_above_cap
-            inc_tax_t        = base.income_tax
-            corp_tax_t       = base.corp_tax
-            Y_t              = base.Y
-            earn_pw_t        = base.earn_per_worker
-            btax_oasi_rate_t = btax_rate_oasi_base
-            btax_hi_rate_t   = btax_rate_hi_base
-            new_ben_scale_t  = 1.0
-        end
 
         # --- PIA factor indexing: override new_ben_scale_t if enabled ---
         if pia_factor_indexing && !isnothing(reform_year) && yr >= reform_year
@@ -1892,17 +1954,21 @@ function project_economy(
             new_ben_scale_t = pia_yr / max(pia_current_law, 1e-10)
         end
 
+        # === Scale model units → nominal dollars ===
         N_hh_t     = N_hh * cum_pop[t]
-        GDP_real_t = Y_t * cum_A[t] * mu * N_hh_t
+        GDP_real_t = Y_mu * cum_A[t] * mu * N_hh_t
         GDP_nom_t  = GDP_real_t * cum_price[t]
-        avg_earn_t = earn_pw_t * cum_A[t] * mu * cum_price[t]
+        avg_earn_t = (w_mu * L_mu / max(base.worker_mass, 1e-10)) *
+                     cum_A[t] * mu * cum_price[t]
 
-        total_pay_nom_t   = base.total_payroll * cum_A[t] * mu * cum_price[t] * N_hh_t
+        # Payroll — derived from w·L on transition path
+        total_pay_nom_t   = w_mu * L_mu * cum_A[t] * mu * cum_price[t] * N_hh_t
         wage_cap_ratio    = cum_wage[t] / (cap_nom_vec[t] / cap_base_dollars)
         pct_above_adj     = min(0.50, pct_above_t * wage_cap_ratio)
         taxable_pay_nom_t = total_pay_nom_t * (1.0 - pct_above_adj)
         fica_rev_nom_t    = fica_rate_t * taxable_pay_nom_t
 
+        # SS outlays — benefit level interpolated, demographics exogenous
         phi_t          = min(0.20, 1.0 / (working_years * dep_t))
         new_ben_real_t = base.ss_ben_per_retiree * cum_new_ben[t] * new_ben_scale_t
         avg_ben_real   = (1.0-phi_t)*avg_ben_real + phi_t*new_ben_real_t
@@ -1910,6 +1976,7 @@ function project_economy(
         n_ret_t        = base.retiree_mass * dep_scale * N_hh_t
         ss_outlays_nom_t = avg_ben_nom * n_ret_t
 
+        # Benefit taxation — bracket creep on interpolated rates
         base_frac_oasi   = max(btax_oasi_rate_t / 0.85, 1e-6)
         creep_oasi       = 1.0 / (1 + (1/base_frac_oasi - 1) *
                                   exp(-thresh_sens * log(cum_price[t])))
@@ -1924,6 +1991,7 @@ function project_economy(
         ss_btax_hi_nom_t    = btax_hi_adj   * avg_ben_nom * n_ret_t
         ss_btax_total_nom_t = ss_btax_oasi_nom_t + ss_btax_hi_nom_t
 
+        # Trust fund dynamics
         r_nom_t        = (1.0 + par[:r_G]) * (1.0 + inf_vec[t]) - 1.0
         tf_interest_t  = trust_fund > 0 ? trust_fund * trust_fund_rate : 0.0
         ss_cash_flow_t = fica_rev_nom_t + ss_btax_oasi_nom_t - ss_outlays_nom_t
@@ -1931,9 +1999,10 @@ function project_economy(
         ss_balance_t   = ss_total_inc_t - ss_outlays_nom_t
         trust_fund    += ss_balance_t
 
-        other_tax_nom_t = (inc_tax_t + corp_tax_t) * cum_A[t] * mu * cum_price[t] * N_hh_t
+        # Government budget — corp tax from transition path, income tax interpolated
+        other_tax_nom_t = (inc_tax_mu + corp_tax_mu) * cum_A[t] * mu * cum_price[t] * N_hh_t
         total_tax_nom_t = fica_rev_nom_t + other_tax_nom_t
-        G_nom_t         = base.G * cum_A[t] * mu * cum_price[t] * N_hh_t
+        G_nom_t         = par[:G_residual_share] * GDP_nom_t
 
         debt_t = t == 1 ?
             base.D * mu * N_hh * cum_price[t] :
@@ -2040,102 +2109,6 @@ function project_economy(
      debt_to_gdp=debt_to_gdp_v,
      depletion_year=depl,
      cashflow_deficit_year=cf_def,
-     label=label)
+     label=label,
+     convergence_rate=conv_rate)
 end
-
-# ============================================================
-# CONVENIENCE: run all four policy variants
-# ============================================================
-
-function score_all_reforms(;
-    n_years::Int     = 75,
-    start_year::Int  = 2025,
-    reform_year::Int = 2027,
-    reform_phase_in::Int = 10,
-    kwargs...
-)
-    println("=" ^ 60)
-    println("  SCORING SPOUSAL/SURVIVOR BENEFIT REFORMS")
-    println("=" ^ 60)
-
-    # --- Current law baseline ---
-    par_base = create_params(benefit_fn=benefits_current_law)
-    ss_base  = solve_steady_state(par_base, benefit_fn=benefits_current_law)
-
-    proj_base = project_economy(ss_base;
-        n_years=n_years, start_year=start_year,
-        label="Current Law", kwargs...)
-
-    # --- Reform 1: Capped spousal ---
-    par_cap = create_params(benefit_fn=benefits_capped_spousal)
-    ss_cap  = solve_steady_state(par_cap, benefit_fn=benefits_capped_spousal)
-
-    proj_cap = project_economy(ss_base;
-        n_years=n_years, start_year=start_year,
-        ss_reform=ss_cap, reform_year=reform_year,
-        reform_phase_in=reform_phase_in,
-        label="Capped Spousal", kwargs...)
-
-    # --- Reform 2: Earnings sharing ---
-    par_es = create_params(benefit_fn=benefits_earnings_sharing)
-    ss_es  = solve_steady_state(par_es, benefit_fn=benefits_earnings_sharing)
-
-    proj_es = project_economy(ss_base;
-        n_years=n_years, start_year=start_year,
-        ss_reform=ss_es, reform_year=reform_year,
-        reform_phase_in=reform_phase_in,
-        label="Earnings Sharing", kwargs...)
-
-    # --- Reform 3: Caregiver credits ---
-    par_cg = create_params(benefit_fn=benefits_caregiver_credits,
-                           aime_modifier=caregiver_modifier)
-    ss_cg  = solve_steady_state(par_cg,
-                                benefit_fn=benefits_caregiver_credits,
-                                aime_modifier=caregiver_modifier)
-
-    proj_cg = project_economy(ss_base;
-        n_years=n_years, start_year=start_year,
-        ss_reform=ss_cg, reform_year=reform_year,
-        reform_phase_in=reform_phase_in,
-        label="Caregiver Credits", kwargs...)
-
-    # --- Comparison summary ---
-    println("\n" * "=" ^ 60)
-    println("  REFORM COMPARISON SUMMARY")
-    println("=" ^ 60)
-
-    function summary_row(proj)
-        w10 = min(10, n_years); w75 = min(75, n_years)
-        depl = isnothing(proj.depletion_year) ?
-               "solvent" : string(proj.depletion_year)
-        cost10 = mean(proj.ss_cost_rate[1:w10])
-        cost75 = mean(proj.ss_cost_rate[1:w75])
-        outlay75 = sum(proj.ss_outlays_nom[1:w75])
-        (label=proj.label, depl=depl, cost10=cost10, cost75=cost75,
-         outlay75=outlay75)
-    end
-
-    rows = [summary_row(p) for p in [proj_base, proj_cap, proj_es, proj_cg]]
-
-    @printf("\n  %-20s %10s %10s %10s %14s\n",
-            "Policy", "TF Depl", "Cost10y%", "Cost75y%", "Outlays75y(\$T)")
-    println("  " * repeat("-", 66))
-    for r in rows
-        @printf("  %-20s %10s %9.2f%% %9.2f%% %13.1f\n",
-                r.label, r.depl, r.cost10, r.cost75, r.outlay75/1000)
-    end
-
-    base_out = sum(proj_base.ss_outlays_nom[1:min(75,n_years)])
-    println("\n  Savings vs. current law (75-yr outlays):")
-    for r in rows[2:end]
-        diff = r.outlay75 - base_out/1000*1000
-        @printf("    %-20s: \$%.1fT (%+.1f%%)\n",
-                r.label, diff/1000,
-                diff / base_out * 100)
-    end
-
-    (baseline=proj_base, capped_spousal=proj_cap,
-     earnings_sharing=proj_es, caregiver_credits=proj_cg,
-     ss_baseline=ss_base, ss_capped=ss_cap,
-     ss_sharing=ss_es, ss_caregiver=ss_cg)
-end;
