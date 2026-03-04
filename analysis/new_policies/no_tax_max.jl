@@ -8,7 +8,8 @@ using XLSX
 using CSV;
 # Solve steady state
 par = create_params()
-ss  = solve_steady_state(par);
+ss  = solve_steady_state(par)
+dep_path = CSV.read("C:/Users/kchanwong/Documents/PWBM/julia_port/dep_rat.csv", DataFrame) |> DataFrame;
 # Increase Payroll Tax Rate #
 par_reform = create_params()
 par_reform[:ss_cap_frac] = 100000
@@ -18,7 +19,6 @@ ss_reform  = solve_steady_state(par_reform);
 proj_no_tax_max = project_economy(ss,
     ss_reform        = ss_reform,
     reform_year      = 2029,
-    reform_phase_in  = 8,
     n_years          = 75,
     start_year       = 2025,
     g_A              = 0.0113,

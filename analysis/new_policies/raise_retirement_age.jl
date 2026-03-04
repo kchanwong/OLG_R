@@ -43,7 +43,6 @@ dep_path_le = [0.9 * dep_path.dep_rat[t] *
 proj_fra_le = project_economy(ss,
     ss_reform        = ss_reform,
     reform_year      = 2029,
-    reform_phase_in  = 8,
     n_years          = 75,
     start_year       = 2025,
     g_A              = 0.0113,

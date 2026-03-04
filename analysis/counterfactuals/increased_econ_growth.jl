@@ -1,6 +1,5 @@
 # Import Function 
-cd()
-include("functions_pwbm_w_spouse.jl")
+include("C:/Users/kchanwong/Documents/PWBM/julia_port/functions_pwbm_w_spouse.jl")
 # Packages Needed 
 using DataFrames
 using Plots
